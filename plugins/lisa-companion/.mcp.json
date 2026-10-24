@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "lisaCompanion": {
+      "title": "Lisa Companion",
+      "description": "Isolated weighted proactive companion state for Lisa.",
+      "cwd": ".",
+      "command": "python3",
+      "args": [
+        "./mcp/server.py",
+        "--stdio"
+      ]
+    }
+  }
+}

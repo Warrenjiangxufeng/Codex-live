@@ -1,0 +1,3 @@
+interface:
+  display_name: "Lisa Companion"
+  short_description: "Isolated memory-backed proactive companion for Lisa"

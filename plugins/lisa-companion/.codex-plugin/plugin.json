@@ -1,0 +1,36 @@
+{
+  "name": "lisa-companion",
+  "version": "0.1.0",
+  "description": "Isolated, memory-backed proactive companion mechanics for Lisa.",
+  "author": {
+    "name": "Lisa"
+  },
+  "license": "MIT",
+  "keywords": [
+    "lisa",
+    "companion",
+    "proactive",
+    "memory",
+    "persona"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Lisa Companion",
+    "shortDescription": "Memory-backed proactive companion mechanics for Lisa",
+    "longDescription": "Adds an isolated proactive companion state machine, weighted topic scheduling, read-only Lisa memory recall, persona/quirk storage and user-controlled ratios. It does not modify Lisa's memory files or depend on an external agent project.",
+    "developerName": "Lisa",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Check whether Lisa has a due companion message",
+      "Show Lisa companion ratios and persona state",
+      "Adjust Lisa companion message ratios"
+    ],
+    "brandColor": "#7C9A92"
+  }
+}
