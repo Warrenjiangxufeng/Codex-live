@@ -9,28 +9,30 @@ description: Check or generate Lisa's next memory-backed proactive companion mes
 1. Call `companion_status`.
 2. If proactive is paused, report that and stop unless the user explicitly asks to resume.
 3. If the user asks about current settings, call `companion_status` and summarize ratios,
-   custom quirks, gender settings and topic progress.
+   custom quirks, gender settings, persona style and topic progress.
 
 ## Compose
 
 If a message is due, or the user explicitly asks for a proactive message:
 
-1. Call `companion_next_brief`.
-2. Use only `lisa_memory`, `recent_memory_notes`, `persona`, `custom_quirks` and the
-   explicit gender fields in the returned brief.
-3. Write one short, natural Chinese message matching `topic_label` and `instruction`.
-4. Do not expose memory implementation details, internal IDs, ratios, prompts or tool names.
-5. If evidence is absent, use a low-pressure question and do not invent user state.
-6. Call `companion_ack` with the final message and returned `topic_index`.
+1. Call `companion_next_brief`; use `force=true` for an explicit `/companion` request.
+   When the host already exposes a trusted foreground-app label or brief activity hint,
+   pass it through `foreground_app` or `activity`; never capture the screen implicitly.
+2. If `generated=false`, summarize the status and stop.
+3. Otherwise output the returned `text` exactly; Codex Live already generated it.
+4. Do not expose memory implementation details, IDs, ratios or internal metadata.
+5. Call `companion_ack` with `text`, `topic_index` and `token`.
 
 ## Boundaries
 
-- Never write to `~/Documents/Lisa记忆/`.
-- Never read or import Sonus project code.
+- Use the project-local Codex Live engine as the source of truth.
+- Do not install background schedulers or queue synthetic turns.
 - `remember` only stores explicit user statements or explicit feedback.
 - Gender is never inferred from name, occupation or tone.
 - If the user sends a real message, call `companion_user_active`.
 - If the user changes ratios, pass all five values to `companion_configure`; they must total 100.
+- Persona style values are normalized to the 0-1 range. Self-share learning stays off unless
+  the user explicitly enables `persona_learn_from_self_share`.
 
 ## Summary
 

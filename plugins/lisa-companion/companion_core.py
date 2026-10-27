@@ -1,588 +1,489 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import re
-import sqlite3
-import subprocess
-import time
+import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 
-TOPIC_WEIGHTS: tuple[tuple[str, int], ...] = (
-    ("daily_emotion", 20),
-    ("work_coding", 20),
-    ("self_evolution", 20),
-    ("user_gender", 20),
-    ("user_custom", 20),
+PLUGIN_ROOT = Path(__file__).resolve().parent
+VENDOR_ROOT = PLUGIN_ROOT / "vendor"
+if str(VENDOR_ROOT) not in sys.path:
+    sys.path.insert(0, str(VENDOR_ROOT))
+
+from codex_live.config import RuntimeConfig, resolve_config, save_user_config  # noqa: E402
+from codex_live.memory import MemoryStore  # noqa: E402
+from codex_live.model import create_model_client  # noqa: E402
+from codex_live.proactive import (  # noqa: E402
+    PresenceContext,
+    ProactiveScheduler,
+    ProactiveService,
+    parse_topic_ratios,
+    proactive_topic_schedule,
 )
-TOPIC_LABELS = {
-    "daily_emotion": "日常与情绪",
-    "work_coding": "工作与 coding",
-    "self_evolution": "Lisa 性格与成长",
-    "user_gender": "性别风格融合",
-    "user_custom": "用户自定义癖好",
-}
-TOPIC_ALIASES = {
-    "daily_emotion": "daily_emotion",
-    "daily": "daily_emotion",
-    "日常": "daily_emotion",
-    "情绪": "daily_emotion",
-    "work_coding": "work_coding",
-    "work": "work_coding",
-    "coding": "work_coding",
-    "工作": "work_coding",
-    "self_evolution": "self_evolution",
-    "persona": "self_evolution",
-    "成长": "self_evolution",
-    "性格": "self_evolution",
-    "user_gender": "user_gender",
-    "gender": "user_gender",
-    "性别": "user_gender",
-    "user_custom": "user_custom",
-    "custom": "user_custom",
-    "癖好": "user_custom",
-    "兴趣": "user_custom",
-}
-ENTRY_CATEGORIES = {"persona", "quirk", "user_fact"}
 
 
-def default_state_home() -> Path:
-    override = os.environ.get("LISA_COMPANION_HOME")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / "Library" / "Application Support" / "LisaCompanion"
+SESSION_ID = "codex-live"
 
 
-def schedule_for(weights: tuple[tuple[str, int], ...]) -> tuple[str, ...]:
-    ratios = dict(weights)
-    if set(ratios) != set(TOPIC_LABELS):
-        raise ValueError("主题集合不完整")
-    if any(weight < 0 for weight in ratios.values()):
-        raise ValueError("比例不能为负数")
-    if sum(ratios.values()) != 100:
-        raise ValueError(f"比例合计必须为 100，当前为 {sum(ratios.values())}")
-    order = [topic for topic, _ in weights]
-    current = {topic: 0 for topic in order}
-    schedule: list[str] = []
-    for _ in range(100):
-        for topic in order:
-            current[topic] += ratios[topic]
-        chosen = max(
-            order,
-            key=lambda topic: (current[topic], -order.index(topic)),
-        )
-        current[chosen] -= 100
-        schedule.append(chosen)
-    return tuple(schedule)
+def _bridge_workspace() -> Path:
+    configured = os.environ.get("LISA_COMPANION_WORKSPACE", "").strip()
+    return Path(configured).expanduser() if configured else Path.home()
 
 
-def parse_ratio_values(
-    values: list[str],
-    current: tuple[tuple[str, int], ...] = TOPIC_WEIGHTS,
-) -> tuple[tuple[str, int], ...]:
-    ratios = dict(current)
-    for value in values:
-        for token in str(value).replace("，", ",").split(","):
-            if not token.strip():
-                continue
-            match = re.fullmatch(r"([^=:：]+)[=:：](\d+)", token.strip())
-            if not match:
-                raise ValueError(f"无法解析比例: {token}")
-            topic = TOPIC_ALIASES.get(match.group(1).strip().lower())
-            if topic is None:
-                raise ValueError(f"未知主题: {match.group(1)}")
-            ratios[topic] = int(match.group(2))
-    schedule_for(tuple((topic, ratios[topic]) for topic, _ in current))
-    return tuple((topic, ratios[topic]) for topic, _ in current)
+class CodexLiveBridge:
+    """Codex plugin adapter for the independent codex-live engine."""
 
-
-class LisaMemoryReader:
-    """Read-only access to Lisa's existing memory system."""
-
-    def __init__(self, memory_home: Path | None = None) -> None:
-        self.memory_home = (
-            memory_home
-            or Path(
-                os.environ.get(
-                    "LISA_MEMORY_HOME",
-                    Path.home() / "Documents" / "Lisa记忆",
-                )
-            ).expanduser()
-        )
-        self.script = self.memory_home / "scripts" / "mem.sh"
-
-    def recall(self, query: str, *, timeout_sec: int = 10) -> dict[str, Any]:
-        if not self.script.is_file():
-            return {"ok": False, "error": f"memory script not found: {self.script}"}
-        try:
-            completed = subprocess.run(
-                ["/bin/bash", str(self.script), "recall", query],
-                text=True,
-                capture_output=True,
-                timeout=max(1, min(30, timeout_sec)),
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            return {"ok": False, "error": str(error)}
-        text = (completed.stdout or completed.stderr or "").strip()
-        return {
-            "ok": completed.returncode == 0,
-            "source": str(self.script),
-            "text": text[:8000],
-        }
-
-    def recent_notes(self, *, lines_per_file: int = 16) -> list[dict[str, str]]:
-        rows: list[dict[str, str]] = []
-        for name in ("会话状态.md", "用户记忆.md"):
-            path = self.memory_home / name
-            if not path.is_file():
-                continue
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            lines = [line.strip() for line in content.splitlines() if line.strip()]
-            rows.append(
-                {
-                    "path": str(path),
-                    "text": "\n".join(lines[-max(1, lines_per_file) :])[:5000],
-                }
-            )
-        return rows
-
-
-@dataclass(frozen=True)
-class CompanionConfig:
-    ratios: tuple[tuple[str, int], ...]
-    base_interval_sec: int
-    backoff_factor: int
-    lisa_gender: str
-    user_gender: str
-    custom_quirks: tuple[str, ...]
-
-
-class CompanionStore:
     def __init__(
         self,
-        home: Path | None = None,
+        workspace: Path | None = None,
         *,
-        memory_reader: LisaMemoryReader | None = None,
-        clock=time.time,
+        config: RuntimeConfig | None = None,
     ) -> None:
-        self.home = (home or default_state_home()).expanduser()
-        self.home.mkdir(parents=True, exist_ok=True)
-        try:
-            self.home.chmod(0o700)
-        except OSError:
-            pass
-        self.db_path = self.home / "state.db"
-        self.memory = memory_reader or LisaMemoryReader()
-        self.clock = clock
-        self._connection = sqlite3.connect(str(self.db_path), timeout=30)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._initialize()
-        try:
-            self.db_path.chmod(0o600)
-        except OSError:
-            pass
+        self.workspace = (workspace or _bridge_workspace()).expanduser().resolve()
+        self._config_override = config
+        self.config: RuntimeConfig
+        self.memory: MemoryStore
+        self.scheduler: ProactiveScheduler
+        self._proactive: ProactiveService | None = None
+        self._pending: dict[str, Any] | None = None
+        self._load_runtime()
 
-    def close(self) -> None:
-        self._connection.close()
-
-    def _initialize(self) -> None:
-        now = self.clock()
-        with self._connection:
-            self._connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS companion_state (
-                    id INTEGER PRIMARY KEY CHECK(id = 1),
-                    paused INTEGER NOT NULL DEFAULT 0,
-                    ratios TEXT NOT NULL,
-                    topic_index INTEGER NOT NULL DEFAULT 0,
-                    next_due_at REAL NOT NULL,
-                    last_sent_at REAL,
-                    last_user_at REAL,
-                    unanswered_streak INTEGER NOT NULL DEFAULT 0,
-                    base_interval_sec INTEGER NOT NULL DEFAULT 300,
-                    backoff_factor INTEGER NOT NULL DEFAULT 2,
-                    lisa_gender TEXT NOT NULL DEFAULT '',
-                    user_gender TEXT NOT NULL DEFAULT '',
-                    custom_quirks TEXT NOT NULL DEFAULT '[]',
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS companion_entries (
-                    id TEXT PRIMARY KEY,
-                    category TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS companion_messages (
-                    id TEXT PRIMARY KEY,
-                    topic TEXT NOT NULL,
-                    topic_index INTEGER NOT NULL,
-                    text TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                """
-            )
-            self._connection.execute(
-                """
-                INSERT OR IGNORE INTO companion_state(
-                    id, paused, ratios, topic_index, next_due_at,
-                    unanswered_streak, base_interval_sec, backoff_factor,
-                    lisa_gender, user_gender, custom_quirks, updated_at
-                ) VALUES (1, 0, ?, 0, ?, 0, 300, 2, '', '', '[]', ?)
-                """,
-                (
-                    json.dumps(dict(TOPIC_WEIGHTS), ensure_ascii=False),
-                    now + 300,
-                    self._timestamp(),
-                ),
-            )
-
-    def _timestamp(self) -> str:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock()))
-
-    def _state_row(self) -> sqlite3.Row:
-        row = self._connection.execute(
-            "SELECT * FROM companion_state WHERE id = 1"
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("companion state is not initialized")
-        return row
-
-    def config(self) -> CompanionConfig:
-        row = self._state_row()
-        raw_ratios = json.loads(str(row["ratios"]))
-        ratios = tuple((topic, int(raw_ratios[topic])) for topic, _ in TOPIC_WEIGHTS)
-        return CompanionConfig(
-            ratios=ratios,
-            base_interval_sec=int(row["base_interval_sec"]),
-            backoff_factor=int(row["backoff_factor"]),
-            lisa_gender=str(row["lisa_gender"]),
-            user_gender=str(row["user_gender"]),
-            custom_quirks=tuple(json.loads(str(row["custom_quirks"]))),
+    def _load_runtime(self) -> None:
+        self.config = self._config_override or resolve_config(self.workspace)
+        self.memory = MemoryStore(self.config.data_dir / "memory.db")
+        self.scheduler = ProactiveScheduler(
+            self.config.data_dir / "memory.db",
+            self.config.proactive,
+            SESSION_ID,
         )
+
+    def _ensure_proactive(self) -> ProactiveService:
+        if self._proactive is None:
+            self._proactive = ProactiveService(
+                model=create_model_client(self.config),
+                memory=self.memory,
+                scope=str(self.workspace),
+                config=self.config.proactive,
+                persona=self.config.persona,
+            )
+        return self._proactive
 
     def status(self) -> dict[str, Any]:
-        row = self._state_row()
-        config = self.config()
-        streak = int(row["unanswered_streak"])
-        delay = min(
-            2**31 - 1,
-            config.base_interval_sec * config.backoff_factor**streak,
+        state = asdict(self.scheduler.status())
+        schedule = proactive_topic_schedule(self.config.proactive.topic_weights)
+        topic_index = int(state["topic_index"])
+        state.update(
+            {
+                "engine": "codex-live",
+                "workspace": str(self.workspace),
+                "data_dir": str(self.config.data_dir),
+                "due": (
+                    not state["paused"]
+                    and self.scheduler.seconds_until_due() <= 0
+                ),
+                "next_topic": schedule[topic_index % len(schedule)],
+                "topic_weights": dict(self.config.proactive.topic_weights),
+                "base_interval_sec": self.config.proactive.base_interval_sec,
+                "backoff_factor": self.config.proactive.backoff_factor,
+                "codex_live_gender": self.config.proactive.codex_live_gender,
+                "user_gender": self.config.proactive.user_gender,
+                "custom_quirks": list(self.config.proactive.custom_quirks),
+                "persona": {
+                    "name": self.config.persona.name,
+                    "configured": bool(self.config.persona.prompt),
+                    "example_count": len(self.config.persona.examples),
+                    "style": dict(self.config.persona.style),
+                    "context_intensity": dict(
+                        self.config.persona.context_intensity
+                    ),
+                    "learn_from_self_share": (
+                        self.config.persona.learn_from_self_share
+                    ),
+                },
+            }
         )
-        schedule = schedule_for(config.ratios)
-        index = int(row["topic_index"])
-        return {
-            "paused": bool(row["paused"]),
-            "ratios": dict(config.ratios),
-            "topic_index": index,
-            "next_topic": schedule[index % len(schedule)],
-            "next_due_at": float(row["next_due_at"]),
-            "seconds_until_due": max(0.0, float(row["next_due_at"]) - self.clock()),
-            "due": (
-                not bool(row["paused"])
-                and float(row["next_due_at"]) <= self.clock()
-            ),
-            "unanswered_streak": streak,
-            "next_delay_sec": delay,
-            "lisa_gender_configured": bool(config.lisa_gender),
-            "user_gender_configured": bool(config.user_gender),
-            "custom_quirks": list(config.custom_quirks),
-            "state_db": str(self.db_path),
-        }
+        return state
 
-    def configure(self, **updates: Any) -> dict[str, Any]:
-        row = self._state_row()
-        ratios = tuple(self.config().ratios)
-        if "ratios" in updates and updates["ratios"] is not None:
-            ratio_value = updates["ratios"]
-            if isinstance(ratio_value, dict):
-                tokens = [f"{key}={value}" for key, value in ratio_value.items()]
-            elif isinstance(ratio_value, list):
-                tokens = [str(value) for value in ratio_value]
-            else:
-                tokens = [str(ratio_value)]
-            ratios = parse_ratio_values(tokens, ratios)
-        base = max(
-            30,
-            int(updates.get("base_interval_sec", row["base_interval_sec"])),
-        )
-        backoff = max(
-            2,
-            int(updates.get("backoff_factor", row["backoff_factor"])),
-        )
-        quirks = updates.get(
-            "custom_quirks",
-            json.loads(str(row["custom_quirks"])),
-        )
-        if isinstance(quirks, str):
-            quirks = [item.strip() for item in re.split(r"[,，\n]", quirks) if item.strip()]
-        quirks = list(dict.fromkeys(str(item).strip() for item in quirks if str(item).strip()))
-        with self._connection:
-            self._connection.execute(
-                """
-                UPDATE companion_state
-                SET ratios = ?, base_interval_sec = ?, backoff_factor = ?,
-                    lisa_gender = ?, user_gender = ?, custom_quirks = ?,
-                    updated_at = ?
-                WHERE id = 1
-                """,
-                (
-                    json.dumps(dict(ratios), ensure_ascii=False),
-                    base,
-                    backoff,
-                    str(updates.get("lisa_gender", row["lisa_gender"]) or "").strip(),
-                    str(updates.get("user_gender", row["user_gender"]) or "").strip(),
-                    json.dumps(quirks, ensure_ascii=False),
-                    self._timestamp(),
+    def next_brief(
+        self,
+        *,
+        force: bool = False,
+        foreground_app: str = "",
+        activity: str = "",
+    ) -> dict[str, Any]:
+        status = self.status()
+        if status["paused"] or (not status["due"] and not force):
+            self._pending = None
+            return {"generated": False, **status}
+        allowed, idle_seconds = self.scheduler.presence_gate()
+        if not force and not allowed:
+            delay = self.scheduler.defer(30)
+            self._pending = None
+            return {
+                "generated": False,
+                "engine": "codex-live",
+                "reason": "presence_deferred",
+                "deferred_sec": delay,
+                "idle_seconds": idle_seconds,
+                **self.status(),
+            }
+
+        proactive = self._ensure_proactive()
+        try:
+            text, meta = proactive.generate(
+                self.scheduler.recent_message_texts(5),
+                sequence_index=self.scheduler.current_topic_index(),
+                presence=PresenceContext(
+                    idle_seconds=idle_seconds,
+                    foreground_app=str(foreground_app).strip(),
+                    activity=str(activity).strip(),
                 ),
             )
+        except Exception as error:
+            self._pending = None
+            self.scheduler.mark_failed()
+            return {
+                "generated": False,
+                "engine": "codex-live",
+                "reason": "generation_failed",
+                "failure_reason": str(error)[:400],
+                **self.status(),
+            }
+        topic_index = self.scheduler.current_topic_index()
+        token = f"brief_{uuid.uuid4().hex[:12]}"
+        self._pending = {
+            "token": token,
+            "text": text,
+            "meta": meta,
+            "topic_index": topic_index,
+        }
+        return {
+            "generated": True,
+            "engine": "codex-live",
+            "token": token,
+            "text": text,
+            "topic_index": topic_index,
+            "topic": meta.get("topic"),
+            "topic_label": meta.get("topic_label"),
+            "scheduled_topic": meta.get("scheduled_topic"),
+            "topic_weight": meta.get("topic_weight"),
+            "status": status,
+        }
+
+    def ack(
+        self,
+        text: str,
+        topic_index: int,
+        *,
+        token: str = "",
+    ) -> dict[str, Any]:
+        pending = self._pending
+        if pending is None:
+            raise ValueError("没有待确认的主动消息")
+        if token and token != pending["token"]:
+            raise ValueError("主动消息 token 已失效")
+        if int(topic_index) != int(pending["topic_index"]):
+            raise ValueError("主动消息 topic_index 已变化")
+
+        clean = " ".join(str(text or pending["text"]).split()).strip()
+        if not clean:
+            raise ValueError("主动消息不能为空")
+        meta = dict(pending["meta"])
+        proactive = self._ensure_proactive()
+        message_id = self.scheduler.record_message(clean)
+        memory_id = proactive.record_delivery(
+            clean,
+            meta,
+            message_id=message_id,
+            trigger="codex_live",
+        )
+        delay = self.scheduler.mark_sent()
+        self._pending = None
+        return {
+            "engine": "codex-live",
+            "text": clean,
+            "message_id": message_id,
+            "memory_id": memory_id,
+            "next_delay_sec": delay,
+            "topic": meta.get("topic"),
+            "topic_label": meta.get("topic_label"),
+            "status": self.status(),
+        }
+
+    def user_active(self) -> dict[str, Any]:
+        self.scheduler.user_activity()
+        return self.status()
+
+    def pause(self, paused: bool = True) -> dict[str, Any]:
+        if paused:
+            self.scheduler.pause()
+        else:
+            self.scheduler.resume()
+        return self.status()
+
+    def reset(self) -> dict[str, Any]:
+        self.scheduler.reset()
+        return self.status()
+
+    def configure(self, updates: dict[str, Any]) -> dict[str, Any]:
+        current = self.config.proactive
+        current_persona = self.config.persona
+        payload: dict[str, Any] = {}
+        persona_payload: dict[str, Any] = {}
+        if updates.get("ratios") is not None:
+            raw = updates["ratios"]
+            if isinstance(raw, dict):
+                tokens = [f"{key}={value}" for key, value in raw.items()]
+            else:
+                tokens = [str(raw)]
+            weights = parse_topic_ratios(tokens, current.topic_weights)
+            payload["topic_weights"] = dict(weights)
+        if "base_interval_sec" in updates:
+            payload["base_interval_sec"] = max(
+                1, int(updates["base_interval_sec"])
+            )
+        if "backoff_factor" in updates:
+            payload["backoff_factor"] = max(
+                2, int(updates["backoff_factor"])
+            )
+        for key in (
+            "min_idle_sec",
+            "max_idle_sec",
+            "typing_chars_per_second",
+            "bubble_seconds",
+        ):
+            if key in updates:
+                payload[key] = max(0, int(updates[key]))
+        if "lisa_gender" in updates:
+            payload["codex_live_gender"] = str(updates["lisa_gender"]).strip()
+        if "user_gender" in updates:
+            payload["user_gender"] = str(updates["user_gender"]).strip()
+        if "custom_quirks" in updates:
+            quirks = updates["custom_quirks"]
+            payload["custom_quirks"] = (
+                [item.strip() for item in quirks if str(item).strip()]
+                if isinstance(quirks, list)
+                else []
+            )
+        if "persona_name" in updates:
+            persona_payload["name"] = str(updates["persona_name"]).strip()
+        if "persona_prompt" in updates:
+            persona_payload["prompt"] = str(updates["persona_prompt"]).strip()
+        if "persona_examples" in updates:
+            examples = updates["persona_examples"]
+            if not isinstance(examples, list):
+                raise ValueError("persona_examples 必须是字符串数组")
+            persona_payload["examples"] = [
+                str(item).strip()
+                for item in examples
+                if str(item).strip()
+            ][:20]
+        if "persona_style" in updates:
+            style = updates["persona_style"]
+            if not isinstance(style, dict):
+                raise ValueError("persona_style 必须是 object")
+            merged_style = dict(self.config.persona.style)
+            for key, value in style.items():
+                numeric = float(value)
+                if not 0 <= numeric <= 1:
+                    raise ValueError(f"persona_style.{key} 必须在 0 到 1 之间")
+                merged_style[str(key)] = numeric
+            persona_payload["style"] = merged_style
+        if "persona_context_intensity" in updates:
+            context = updates["persona_context_intensity"]
+            if not isinstance(context, dict):
+                raise ValueError("persona_context_intensity 必须是 object")
+            merged_context = dict(self.config.persona.context_intensity)
+            for key, value in context.items():
+                numeric = float(value)
+                if not 0 <= numeric <= 1:
+                    raise ValueError(
+                        f"persona_context_intensity.{key} 必须在 0 到 1 之间"
+                    )
+                merged_context[str(key)] = numeric
+            persona_payload["context_intensity"] = merged_context
+        if "persona_learn_from_self_share" in updates:
+            persona_payload["learn_from_self_share"] = bool(
+                updates["persona_learn_from_self_share"]
+            )
+        if not payload and not persona_payload:
+            return self.status()
+
+        save_user_config(
+            self.config.data_dir,
+            {
+                key: value
+                for key, value in {
+                    "proactive": payload,
+                    "persona": persona_payload,
+                }.items()
+                if value
+            },
+        )
+        self._config_override = replace(
+            self.config,
+            persona=replace(
+                current_persona,
+                name=str(
+                    persona_payload.get("name", current_persona.name)
+                ).strip(),
+                prompt=str(
+                    persona_payload.get("prompt", current_persona.prompt)
+                ).strip(),
+                examples=tuple(
+                    persona_payload.get(
+                        "examples",
+                        list(current_persona.examples),
+                    )
+                ),
+                style=tuple(
+                    persona_payload.get(
+                        "style",
+                        dict(current_persona.style),
+                    ).items()
+                ),
+                context_intensity=tuple(
+                    persona_payload.get(
+                        "context_intensity",
+                        dict(current_persona.context_intensity),
+                    ).items()
+                ),
+                learn_from_self_share=bool(
+                    persona_payload.get(
+                        "learn_from_self_share",
+                        current_persona.learn_from_self_share,
+                    )
+                ),
+            ),
+            proactive=replace(
+                current,
+                base_interval_sec=max(
+                    1,
+                    int(payload.get("base_interval_sec", current.base_interval_sec)),
+                ),
+                backoff_factor=max(
+                    2,
+                    int(payload.get("backoff_factor", current.backoff_factor)),
+                ),
+                topic_weights=tuple(
+                    payload.get(
+                        "topic_weights",
+                        dict(current.topic_weights),
+                    ).items()
+                ),
+                codex_live_gender=str(
+                    payload.get(
+                        "codex_live_gender",
+                        current.codex_live_gender,
+                    )
+                ).strip(),
+                user_gender=str(
+                    payload.get("user_gender", current.user_gender)
+                ).strip(),
+                custom_quirks=tuple(
+                    payload.get("custom_quirks", list(current.custom_quirks))
+                ),
+                custom_topics=tuple(
+                    payload.get("custom_quirks", list(current.custom_topics))
+                ),
+                min_idle_sec=max(
+                    0,
+                    int(payload.get("min_idle_sec", current.min_idle_sec)),
+                ),
+                max_idle_sec=max(
+                    0,
+                    int(payload.get("max_idle_sec", current.max_idle_sec)),
+                ),
+                typing_chars_per_second=max(
+                    1,
+                    int(
+                        payload.get(
+                            "typing_chars_per_second",
+                            current.typing_chars_per_second,
+                        )
+                    ),
+                ),
+                bubble_seconds=max(
+                    1,
+                    int(
+                        payload.get(
+                            "bubble_seconds",
+                            current.bubble_seconds,
+                        )
+                    ),
+                ),
+            ),
+        )
+        old_memory = self.memory
+        old_scheduler = self.scheduler
+        try:
+            self._proactive = None
+            self._pending = None
+            self._load_runtime()
+        finally:
+            old_scheduler.close()
+            old_memory.close()
         return self.status()
 
     def remember(self, category: str, value: str) -> dict[str, Any]:
         category = category.strip().lower()
-        if category not in ENTRY_CATEGORIES:
+        if category not in {"persona", "quirk", "user_fact"}:
             raise ValueError(f"不支持的类别: {category}")
         clean = " ".join(value.split()).strip()
         if not clean:
             raise ValueError("内容不能为空")
-        clean = clean[:2000]
-        fingerprint = hashlib.sha256(
-            f"{category}|{clean}".encode("utf-8")
-        ).hexdigest()
-        entry_id = f"c_{uuid.uuid4().hex[:12]}"
-        with self._connection:
-            self._connection.execute(
-                """
-                INSERT OR IGNORE INTO companion_entries(
-                    id, category, value, fingerprint, created_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (entry_id, category, clean, fingerprint, self._timestamp()),
+        kind = "persona" if category == "persona" else "preference"
+        tags = ["persistent", category]
+        if category == "quirk":
+            tags.extend(["preference", "quirk"])
+        memory_id = self.memory.add(
+            content=clean,
+            scope="global",
+            kind=kind,
+            status="supported",
+            tags=tuple(tags),
+            source="codex_live",
+            evidence_kind="user_statement",
+        )
+        persona_traits = (
+            self.memory.learn_explicit_persona(
+                clean,
+                evidence_id=memory_id,
             )
-        row = self._connection.execute(
-            "SELECT * FROM companion_entries WHERE fingerprint = ?",
-            (fingerprint,),
-        ).fetchone()
-        return dict(row) if row is not None else {
-            "id": entry_id,
+            if category == "persona"
+            else []
+        )
+        return {
+            "engine": "codex-live",
+            "memory_id": memory_id,
             "category": category,
             "value": clean,
+            "persona_traits_updated": [
+                {
+                    "trait_key": item.get("trait_key"),
+                    "status": item.get("status"),
+                    "confidence": item.get("confidence"),
+                }
+                for item in persona_traits
+            ],
         }
 
-    def recall_entries(
-        self,
-        *,
-        category: str | None = None,
-        limit: int = 20,
-    ) -> list[dict[str, Any]]:
-        if category:
-            rows = self._connection.execute(
-                """
-                SELECT * FROM companion_entries
-                WHERE category = ?
-                ORDER BY created_at DESC LIMIT ?
-                """,
-                (category, max(1, min(100, limit))),
-            ).fetchall()
-        else:
-            rows = self._connection.execute(
-                "SELECT * FROM companion_entries ORDER BY created_at DESC LIMIT ?",
-                (max(1, min(100, limit)),),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def _topic_query(self, base_topic: str) -> str:
-        return {
-            "daily_emotion": "最近 心情 情绪 睡眠 休息 生活 状态 周末",
-            "work_coding": "工作 项目 代码 开发 测试 任务 目标 复盘",
-            "self_evolution": "沟通 表达 性格 习惯 反思 成长",
-            "user_custom": "癖好 兴趣 爱好 收藏 习惯 关注 期待",
-        }.get(base_topic, "最近 记忆")
-
-    def next_brief(self) -> dict[str, Any]:
-        row = self._state_row()
-        config = self.config()
-        schedule = schedule_for(config.ratios)
-        topic_index = int(row["topic_index"])
-        schedule_index = topic_index % len(schedule)
-        topic = schedule[schedule_index]
-        if topic == "user_gender":
-            gender_seen = sum(
-                1 for item in schedule[: schedule_index + 1]
-                if item == "user_gender"
-            )
-            base_topic = (
-                "daily_emotion" if gender_seen % 2 == 1 else "work_coding"
-            )
-        else:
-            base_topic = topic
-        query = self._topic_query(base_topic)
-        memory_recall = self.memory.recall(query)
-        recent_notes = self.memory.recent_notes()
-        entries = self.recall_entries(
-            category="persona" if topic == "self_evolution" else
-            "quirk" if topic == "user_custom" else None,
-            limit=8,
-        )
-        persona = self.recall_entries(category="persona", limit=8)
-        quirks = config.custom_quirks or [
-            item["value"] for item in entries if item["category"] == "quirk"
-        ]
-        instruction = {
-            "daily_emotion": (
-                "基于最近记忆中的生活状态或情绪线索，生成一句轻量关心或自然闲聊。"
-            ),
-            "work_coding": (
-                "基于最近项目/coding 记忆，给一个很小、无压力的推进提醒。"
-            ),
-            "self_evolution": (
-                "只从已积累 persona 和最近沟通中提炼一个稳定表达习惯，不虚构成长。"
-            ),
-            "user_custom": (
-                "优先围绕用户癖好；没有设定时从明确记忆中学习，不编造。"
-            ),
-        }.get(
-            base_topic,
-            (
-                f"底层主题是{TOPIC_LABELS[base_topic]}。"
-                "把 Lisa 明确性别设定和用户明确性别证据融合到语气、称呼中，"
-                "不构成单独身份话题，不做刻板推断。"
-            ),
+    def recall(self, query: str, *, limit: int = 20) -> dict[str, Any]:
+        rows = self.memory.search(
+            query,
+            scope=str(self.workspace),
+            limit=max(1, min(50, int(limit))),
         )
         return {
-            "topic": topic,
-            "topic_label": (
-                f"{TOPIC_LABELS[base_topic]} × 性别风格"
-                if topic == "user_gender"
-                else TOPIC_LABELS[topic]
-            ),
-            "topic_index": topic_index,
-            "ratio": dict(config.ratios)[topic],
-            "base_topic": base_topic,
-            "instruction": instruction,
-            "lisa_memory": memory_recall,
-            "recent_memory_notes": recent_notes,
-            "companion_entries": entries,
-            "persona": persona,
-            "lisa_gender": config.lisa_gender,
-            "user_gender": config.user_gender,
-            "custom_quirks": quirks,
-            "isolation": {
-                "lisa_memory_write": False,
-                "sonus_dependency": False,
-                "state_home": str(self.home),
-            },
+            "engine": "codex-live",
+            "query": query,
+            "items": rows,
+            "memory_write": False,
         }
 
-    def ack(self, text: str, topic_index: int) -> dict[str, Any]:
-        clean = " ".join(str(text).split()).strip()
-        if not clean:
-            raise ValueError("主动消息不能为空")
-        config = self.config()
-        schedule = schedule_for(config.ratios)
-        current = self._state_row()
-        expected = int(current["topic_index"])
-        if int(topic_index) != expected:
-            raise ValueError(
-                f"topic_index 已变化：期望 {expected}，收到 {topic_index}"
-            )
-        topic = schedule[expected % len(schedule)]
-        now = self.clock()
-        streak = int(current["unanswered_streak"]) + 1
-        delay = min(
-            2**31 - 1,
-            config.base_interval_sec * config.backoff_factor**streak,
-        )
-        fingerprint = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:16]
-        message_id = f"m_{uuid.uuid4().hex[:12]}"
-        with self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO companion_messages(
-                    id, topic, topic_index, text, fingerprint, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    message_id,
-                    topic,
-                    expected,
-                    clean[:4000],
-                    fingerprint,
-                    self._timestamp(),
-                ),
-            )
-            self._connection.execute(
-                """
-                UPDATE companion_state
-                SET topic_index = ?, last_sent_at = ?, next_due_at = ?,
-                    unanswered_streak = ?, updated_at = ?
-                WHERE id = 1
-                """,
-                (
-                    expected + 1,
-                    now,
-                    now + delay,
-                    streak,
-                    self._timestamp(),
-                ),
-            )
-        return {
-            "message_id": message_id,
-            "fingerprint": fingerprint,
-            "next_delay_sec": delay,
-            **self.status(),
-        }
-
-    def user_active(self) -> dict[str, Any]:
-        config = self.config()
-        now = self.clock()
-        with self._connection:
-            self._connection.execute(
-                """
-                UPDATE companion_state
-                SET last_user_at = ?, unanswered_streak = 0,
-                    next_due_at = ?, updated_at = ?
-                WHERE id = 1
-                """,
-                (
-                    now,
-                    now + config.base_interval_sec,
-                    self._timestamp(),
-                ),
-            )
-        return self.status()
-
-    def reset(self) -> dict[str, Any]:
-        config = self.config()
-        now = self.clock()
-        with self._connection:
-            self._connection.execute(
-                """
-                UPDATE companion_state
-                SET topic_index = 0, unanswered_streak = 0,
-                    next_due_at = ?, updated_at = ?
-                WHERE id = 1
-                """,
-                (now + config.base_interval_sec, self._timestamp()),
-            )
-        return self.status()
-
-    def pause(self, paused: bool = True) -> dict[str, Any]:
-        with self._connection:
-            self._connection.execute(
-                "UPDATE companion_state SET paused = ?, updated_at = ? WHERE id = 1",
-                (1 if paused else 0, self._timestamp()),
-            )
-        return self.status()
-
+    def close(self) -> None:
+        self.scheduler.close()
+        self.memory.close()

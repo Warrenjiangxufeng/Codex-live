@@ -1,7 +1,7 @@
 {
   "name": "lisa-companion",
-  "version": "0.1.0",
-  "description": "Isolated, memory-backed proactive companion mechanics for Lisa.",
+  "version": "0.2.0",
+  "description": "Independent Codex Live companion plugin with local memory and proactive behavior.",
   "author": {
     "name": "Lisa"
   },
@@ -17,8 +17,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Lisa Companion",
-    "shortDescription": "Memory-backed proactive companion mechanics for Lisa",
-    "longDescription": "Adds an isolated proactive companion state machine, weighted topic scheduling, read-only Lisa memory recall, persona/quirk storage and user-controlled ratios. It does not modify Lisa's memory files or depend on an external agent project.",
+    "shortDescription": "Independent live companion for Codex",
+    "longDescription": "Runs the independent Codex Live companion engine and stores its own configuration, memory, persona, topic weights and proactive state without importing or reading another project.",
     "developerName": "Lisa",
     "category": "Productivity",
     "capabilities": [

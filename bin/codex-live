@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+SELF=$(/usr/local/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
+ROOT=$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)
+export PYTHONPATH="$ROOT/plugins/lisa-companion/vendor${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/local/bin/python3 -m codex_live "$@"

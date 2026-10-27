@@ -11,22 +11,27 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from companion_core import CompanionStore  # noqa: E402
+from companion_core import CodexLiveBridge  # noqa: E402
 
 
 TOOLS = [
     {
         "name": "companion_status",
-        "description": "Show isolated Lisa companion ratios, topic progress, due state and backoff.",
+        "description": "Show Codex Live proactive configuration, due state and progress.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "companion_next_brief",
-        "description": (
-            "Select the next weighted proactive topic and return read-only Lisa memory "
-            "evidence plus an instruction for composing one short message."
-        ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Generate a live message with the independent Codex Live engine.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "default": False},
+                "foreground_app": {"type": "string"},
+                "activity": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
     },
     {
         "name": "companion_ack",
@@ -39,6 +44,7 @@ TOOLS = [
             "properties": {
                 "text": {"type": "string"},
                 "topic_index": {"type": "integer", "minimum": 0},
+                "token": {"type": "string"},
             },
             "required": ["text", "topic_index"],
             "additionalProperties": False,
@@ -47,8 +53,8 @@ TOOLS = [
     {
         "name": "companion_configure",
         "description": (
-            "Update isolated ratios, Lisa/user gender, custom quirks or timing. "
-            "Ratios must total 100."
+            "Update Codex Live ratios, timing, gender, quirks, or stable persona "
+            "style. Ratios must total 100."
         ),
         "inputSchema": {
             "type": "object",
@@ -65,6 +71,38 @@ TOOLS = [
                 },
                 "base_interval_sec": {"type": "integer", "minimum": 30},
                 "backoff_factor": {"type": "integer", "minimum": 2},
+                "min_idle_sec": {"type": "integer", "minimum": 0},
+                "max_idle_sec": {"type": "integer", "minimum": 0},
+                "typing_chars_per_second": {"type": "integer", "minimum": 1},
+                "bubble_seconds": {"type": "integer", "minimum": 1},
+                "persona_name": {"type": "string"},
+                "persona_prompt": {"type": "string"},
+                "persona_examples": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
+                },
+                "persona_style": {
+                    "type": "object",
+                    "properties": {
+                        "sweetness": {"type": "number", "minimum": 0, "maximum": 1},
+                        "playfulness": {"type": "number", "minimum": 0, "maximum": 1},
+                        "warmth": {"type": "number", "minimum": 0, "maximum": 1},
+                        "independence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "initiative": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+                "persona_context_intensity": {
+                    "type": "object",
+                    "properties": {
+                        "chat": {"type": "number", "minimum": 0, "maximum": 1},
+                        "task": {"type": "number", "minimum": 0, "maximum": 1},
+                        "risk": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+                "persona_learn_from_self_share": {"type": "boolean"},
             },
             "additionalProperties": False,
         },
@@ -72,8 +110,7 @@ TOOLS = [
     {
         "name": "companion_remember",
         "description": (
-            "Persist an explicit persona, quirk or user fact in the plugin's isolated "
-            "state database. Never writes Lisa's memory system."
+            "Persist an explicit persona, quirk or user fact through Codex Live memory."
         ),
         "inputSchema": {
             "type": "object",
@@ -91,8 +128,7 @@ TOOLS = [
     {
         "name": "companion_recall",
         "description": (
-            "Read plugin-owned entries and Lisa's memory through the existing read-only "
-            "mem.sh recall interface."
+            "Search Codex Live memory without modifying it."
         ),
         "inputSchema": {
             "type": "object",
@@ -115,7 +151,7 @@ TOOLS = [
     },
     {
         "name": "companion_reset",
-        "description": "Reset topic sequence, streak and next due time.",
+        "description": "Reset Codex Live proactive sequence, streak and due time.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -131,40 +167,43 @@ TOOLS = [
 ]
 
 
-def call_tool(store: CompanionStore, name: str, arguments: dict[str, Any]) -> Any:
+def call_tool(
+    bridge: CodexLiveBridge,
+    name: str,
+    arguments: dict[str, Any],
+) -> Any:
     if name == "companion_status":
-        return store.status()
+        return bridge.status()
     if name == "companion_next_brief":
-        return store.next_brief()
+        return bridge.next_brief(
+            force=bool(arguments.get("force", False)),
+            foreground_app=str(arguments.get("foreground_app", "")),
+            activity=str(arguments.get("activity", "")),
+        )
     if name == "companion_ack":
-        return store.ack(
+        return bridge.ack(
             str(arguments["text"]),
             int(arguments["topic_index"]),
+            token=str(arguments.get("token", "")),
         )
     if name == "companion_configure":
-        return store.configure(**arguments)
+        return bridge.configure(arguments)
     if name == "companion_remember":
-        return store.remember(
+        return bridge.remember(
             str(arguments["category"]),
             str(arguments["value"]),
         )
     if name == "companion_recall":
-        category = arguments.get("category")
-        entries = store.recall_entries(
-            category=str(category) if category else None,
+        return bridge.recall(
+            str(arguments["query"]),
             limit=int(arguments.get("limit", 20)),
         )
-        return {
-            "entries": entries,
-            "lisa_memory": store.memory.recall(str(arguments["query"])),
-            "lisa_memory_write": False,
-        }
     if name == "companion_user_active":
-        return store.user_active()
+        return bridge.user_active()
     if name == "companion_reset":
-        return store.reset()
+        return bridge.reset()
     if name == "companion_pause":
-        return store.pause(bool(arguments["paused"]))
+        return bridge.pause(bool(arguments["paused"]))
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -180,7 +219,7 @@ def error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
-def serve(store: CompanionStore) -> int:
+def serve(bridge: CodexLiveBridge) -> int:
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -200,7 +239,7 @@ def serve(store: CompanionStore) -> int:
                         "capabilities": {"tools": {"listChanged": False}},
                         "serverInfo": {
                             "name": "lisa-companion",
-                            "version": "0.1.0",
+                            "version": "0.2.0",
                         },
                     },
                 )
@@ -211,7 +250,7 @@ def serve(store: CompanionStore) -> int:
             elif method == "tools/call":
                 params = request.get("params") or {}
                 result = call_tool(
-                    store,
+                    bridge,
                     str(params.get("name") or ""),
                     dict(params.get("arguments") or {}),
                 )
@@ -246,13 +285,13 @@ def serve(store: CompanionStore) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stdio", action="store_true")
-    parser.add_argument("--home", type=Path)
+    parser.add_argument("--workspace", type=Path)
     args = parser.parse_args()
-    store = CompanionStore(args.home)
+    bridge = CodexLiveBridge(args.workspace)
     try:
-        return serve(store)
+        return serve(bridge)
     finally:
-        store.close()
+        bridge.close()
 
 
 if __name__ == "__main__":

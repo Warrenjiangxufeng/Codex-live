@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-live-agent"
+version = "0.2.0"
+description = "Independent local companion and coding agent for Codex Live."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lisa" }]
+dependencies = []
+
+[project.scripts]
+codex-live = "codex_live.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "plugins/lisa-companion/vendor" }
+
+[tool.setuptools.packages.find]
+where = ["plugins/lisa-companion/vendor"]
